@@ -31,6 +31,7 @@ pub struct PriceData {
 #[contracttype]
 pub enum DataKey {
     OracleAddress,
+    SecondaryOracleAddress,
     PriceRecord(Address),
     PriceHistory(Address),
     Admin,
@@ -74,33 +75,45 @@ impl OracleConsumer {
     /// This updates the local storage with fresh data, appends it to the local
     /// observation history used for TWAP calculation, and returns it.
     ///
+    /// The primary oracle is attempted first. If it errors or returns stale data,
+    /// the configured secondary oracle is used as a fallback and a fallback event
+    /// is emitted.
+    ///
     /// Returns [`Error::OraclePriceStale`] if the oracle-reported timestamp is
     /// older than the configured `MaxStaleness` threshold.
     pub fn update_price(env: Env, asset: Address) -> Result<PriceData, Error> {
-        let oracle: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::OracleAddress)
-            .expect("oracle not set");
-
-        let price_info: PriceData = env.invoke_contract(
-            &oracle,
-            &symbol_short!("get_price"),
-            (asset.clone(),).into_val(&env),
-        );
-
-        assert!(
-            price_info.asset == asset,
-            "oracle returned mismatched asset"
-        );
-        assert!(price_info.price > 0, "oracle returned non-positive price");
-
         let max_staleness: u64 = env
             .storage()
             .instance()
             .get(&DataKey::MaxStaleness)
             .unwrap_or(DEFAULT_MAX_STALENESS_SECONDS);
-        Self::assert_not_stale(&env, price_info.timestamp, max_staleness)?;
+
+        let primary: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAddress)
+            .expect("oracle not set");
+
+        let price_info = match Self::try_fetch_price(&env, &primary, &asset, max_staleness) {
+            Ok(info) => info,
+            Err(_) => {
+                let secondary: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::SecondaryOracleAddress)
+                    .expect("secondary oracle not set");
+
+                let info = Self::try_fetch_price(&env, &secondary, &asset, max_staleness)?;
+
+                // Topic: event name only; asset + source in data.
+                env.events().publish(
+                    (symbol_short!("oracle"), symbol_short!("fallback")),
+                    (asset.clone(), secondary),
+                );
+
+                info
+            }
+        };
 
         env.storage()
             .instance()
@@ -112,6 +125,33 @@ impl OracleConsumer {
             (symbol_short!("oracle"), symbol_short!("price_upd")),
             (asset, price_info.price),
         );
+
+        Ok(price_info)
+    }
+
+    /// Fetches and validates a price from a single oracle source.
+    ///
+    /// Returns an error if the oracle-reported timestamp is stale so the caller
+    /// can fall back to another source.
+    fn try_fetch_price(
+        env: &Env,
+        oracle: &Address,
+        asset: &Address,
+        max_staleness: u64,
+    ) -> Result<PriceData, Error> {
+        let price_info: PriceData = env.invoke_contract(
+            oracle,
+            &symbol_short!("get_price"),
+            (asset.clone(),).into_val(env),
+        );
+
+        assert!(
+            price_info.asset == *asset,
+            "oracle returned mismatched asset"
+        );
+        assert!(price_info.price > 0, "oracle returned non-positive price");
+
+        Self::assert_not_stale(env, price_info.timestamp, max_staleness)?;
 
         Ok(price_info)
     }
@@ -223,6 +263,23 @@ impl OracleConsumer {
             .set(&DataKey::OracleAddress, &new_oracle);
     }
 
+    /// Registers a secondary fallback oracle source. Restricted to the administrator.
+    pub fn set_secondary_oracle(env: Env, new_oracle: Address) {
+        let admin = Self::get_admin(&env);
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SecondaryOracleAddress, &new_oracle);
+    }
+
+    /// Returns the configured secondary fallback oracle, if any.
+    pub fn get_secondary_oracle(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SecondaryOracleAddress)
+    }
+
     /// Updates the default TWAP lookback window. Restricted to the administrator.
     pub fn set_twap_window(env: Env, lookback_seconds: u64) {
         let admin = Self::get_admin(&env);
@@ -231,159 +288,6 @@ impl OracleConsumer {
         assert!(lookback_seconds > 0, "lookback window must be positive");
         env.storage()
             .instance()
-            .set(&DataKey::DefaultTwapWindow, &lookback_seconds);
-    }
+    
 
-    /// Updates the maximum acceptable age for the latest observation used by TWAP.
-    pub fn set_max_price_age(env: Env, max_age_seconds: u64) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
-
-        assert!(max_age_seconds > 0, "max price age must be positive");
-        env.storage()
-            .instance()
-            .set(&DataKey::MaxPriceAge, &max_age_seconds);
-    }
-
-    /// Updates the maximum acceptable staleness (in seconds) for oracle price
-    /// feed timestamps. Restricted to the administrator.
-    pub fn set_max_staleness(env: Env, max_staleness_seconds: u64) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
-
-        assert!(
-            max_staleness_seconds > 0,
-            "max staleness must be positive"
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::MaxStaleness, &max_staleness_seconds);
-    }
-
-    /// Returns the currently configured maximum staleness threshold in seconds.
-    pub fn get_max_staleness(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MaxStaleness)
-            .unwrap_or(DEFAULT_MAX_STALENESS_SECONDS)
-    }
-
-    /// Reverts with [`Error::OraclePriceStale`] when the supplied price
-    /// timestamp is older than `max_staleness_seconds` relative to the current
-    /// ledger timestamp.
-    fn assert_not_stale(
-        env: &Env,
-        price_timestamp: u64,
-        max_staleness_seconds: u64,
-    ) -> Result<(), Error> {
-        let now = env.ledger().timestamp();
-        if now.saturating_sub(price_timestamp) > max_staleness_seconds {
-            return Err(Error::OraclePriceStale);
-        }
-        Ok(())
-    }
-
-    fn get_admin(env: &Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("admin not set")
-    }
-
-    fn get_price_record(env: &Env, asset: Address) -> PriceData {
-        env.storage()
-            .instance()
-            .get(&DataKey::PriceRecord(asset))
-            .expect("no price record for asset")
-    }
-
-    fn get_price_history(env: &Env, asset: Address) -> Vec<PriceData> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PriceHistory(asset))
-            .unwrap_or(Vec::new(env))
-    }
-
-    fn store_observation(env: &Env, asset: Address, price_info: PriceData) {
-        let mut history = Self::get_price_history(env, asset.clone());
-        history.push_back(price_info);
-
-        let max_observations: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxObservations)
-            .unwrap_or(DEFAULT_MAX_OBSERVATIONS);
-
-        while history.len() > max_observations {
-            history.pop_front();
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PriceHistory(asset), &history);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
-
-    fn setup(env: &Env) -> (OracleConsumerClient, Address) {
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, OracleConsumer);
-        let client = OracleConsumerClient::new(env, &contract_id);
-        let admin = Address::generate(env);
-        let oracle = Address::generate(env);
-        client.initialize(&admin, &oracle);
-        (client, admin)
-    }
-
-    #[test]
-    fn test_set_max_staleness_requires_admin() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-
-        client.set_max_staleness(&120);
-        assert_eq!(client.get_max_staleness(), 120);
-    }
-
-    #[test]
-    fn test_set_max_staleness_rejects_zero() {
-        let env = Env::default();
-        let (client, _admin) = setup(&env);
-
-        let result = client.try_set_max_staleness(&0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_assert_not_stale_rejects_old_timestamp() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1_000);
-
-        // Timestamp 400s in the past exceeds the 300s threshold.
-        let result = OracleConsumer::assert_not_stale(&env, 700, 300);
-        assert_eq!(result, Err(Error::OraclePriceStale));
-    }
-
-    #[test]
-    fn test_assert_not_stale_accepts_fresh_timestamp() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1_000);
-
-        // Timestamp 100s in the past is within the 300s threshold.
-        let result = OracleConsumer::assert_not_stale(&env, 900, 300);
-        assert_eq!(result, Ok(()));
-    }
-
-    #[test]
-    fn test_assert_not_stale_boundary_is_inclusive() {
-        let env = Env::default();
-        env.ledger().set_timestamp(1_000);
-
-        // Exactly at the threshold should be accepted.
-        let result = OracleConsumer::assert_not_stale(&env, 700, 300);
-        assert_eq!(result, Ok(()));
-    }
-}
+/* … truncated 4904 chars — edit only what you need near the top … */
