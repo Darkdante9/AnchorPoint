@@ -43,6 +43,8 @@ COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/node_modules  ./node_modules
 COPY --from=builder /app/dist          ./dist
 COPY --from=builder /app/prisma        ./prisma
+COPY --from=builder /app/tools         ./tools
+COPY --from=builder /app/docker-entrypoint.sh ./docker-entrypoint.sh
 
 # Run as the unprivileged 'node' user supplied by the official Node image.
 USER node
@@ -54,5 +56,5 @@ EXPOSE 3002
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3002/health || exit 1
 
-ENTRYPOINT ["dumb-init", "--"]
+ENTRYPOINT ["dumb-init", "--", "./docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]
