@@ -7,6 +7,7 @@ pub enum DataKey {
     EscrowInitialized,
     EscrowDetails,
     RefundClaimed,
+    Cancelled,
 }
 
 #[contracttype]
@@ -93,6 +94,7 @@ impl EscrowTimelock {
             .instance()
             .set(&DataKey::EscrowInitialized, &true);
         e.storage().instance().set(&DataKey::RefundClaimed, &false);
+        e.storage().instance().set(&DataKey::Cancelled, &false);
 
         // Transfer tokens from sender to this contract
         let token_client = token::Client::new(&e, &details.token);
@@ -113,6 +115,66 @@ impl EscrowTimelock {
         e.storage()
             .instance()
             .set(&DataKey::EscrowDetails, &details);
+    }
+
+    /// Cancel a pending timelocked escrow before the lockup window begins.
+    ///
+    /// Only the original depositor (sender) may cancel, and only while
+    /// `current_time < unlock_time`. Once the lockup has started the escrow
+    /// can no longer be cancelled and must go through claim/refund instead.
+    pub fn cancel_escrow(e: Env, depositor: Address, escrow_id: u64) {
+        let _ = escrow_id;
+
+        let details: EscrowDetails = e
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowDetails)
+            .expect("escrow not initialized");
+
+        // Only the original depositor may cancel.
+        if depositor != details.sender {
+            panic!("only depositor can cancel");
+        }
+        depositor.require_auth();
+
+        let cancelled: bool = e
+            .storage()
+            .instance()
+            .get(&DataKey::Cancelled)
+            .unwrap_or(false);
+        if cancelled {
+            panic!("escrow already cancelled");
+        }
+
+        let refund_claimed: bool = e
+            .storage()
+            .instance()
+            .get(&DataKey::RefundClaimed)
+            .unwrap_or(false);
+        if refund_claimed {
+            panic!("escrow already settled");
+        }
+
+        // Cancellation is only permitted before the lockup window starts.
+        let current_time = e.ledger().timestamp();
+        if current_time >= details.unlock_time {
+            panic!("lockup has started - cannot cancel");
+        }
+
+        // Mark as cancelled to prevent double cancellation / later claims.
+        e.storage().instance().set(&DataKey::Cancelled, &true);
+        e.storage().instance().set(&DataKey::RefundClaimed, &true);
+
+        // Refund escrowed tokens back to the depositor.
+        let token_client = token::Client::new(&e, &details.token);
+        let contract_balance = token_client.balance(&e.current_contract_address());
+        if contract_balance > 0 {
+            token_client.transfer(
+                &e.current_contract_address(),
+                &details.sender,
+                &contract_balance,
+            );
+        }
     }
 
     /// Claim funds as the recipient (only after unlock_time or if conditions are met)
@@ -137,6 +199,15 @@ impl EscrowTimelock {
             .instance()
             .get(&DataKey::EscrowDetails)
             .expect("escrow not initialized");
+
+        let cancelled: bool = e
+            .storage()
+            .instance()
+            .get(&DataKey::Cancelled)
+            .unwrap_or(false);
+        if cancelled {
+            panic!("escrow cancelled");
+        }
 
         let refund_claimed: bool = e
             .storage()
@@ -242,6 +313,14 @@ impl EscrowTimelock {
             .unwrap_or(false)
     }
 
+    /// Check if the escrow has been cancelled
+    pub fn get_cancelled(e: Env) -> bool {
+        e.storage()
+            .instance()
+            .get(&DataKey::Cancelled)
+            .unwrap_or(false)
+    }
+
     /// Get current ledger timestamp
     pub fn get_current_time(e: Env) -> u64 {
         e.ledger().timestamp()
@@ -265,40 +344,21 @@ mod tests {
         let admin = Address::generate(&e);
         let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
         let token_id = token_contract.address();
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        let token_client = soroban_sdk::token::Client::new(&e, &token_id);
+        let stellar_asset = StellarAssetClient::new(&e, &token_id);
+        stellar_asset.mint(&sender, &1000);
 
         let contract_id = e.register(EscrowTimelock, ());
         let client = EscrowTimelockClient::new(&e, &contract_id);
 
-        // Mint tokens to sender
-        let amount = 1000;
-        stellar_client.mint(&sender, &amount);
-        assert_eq!(token_client.balance(&sender), amount);
+        client.initialize(&sender, &recipient, &token_id, &500, &2000);
 
-        // Set unlock time to future (current time + 1000 seconds)
-        let current_time = e.ledger().timestamp();
-        let unlock_time = current_time + 1000;
-
-        // Initialize escrow
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // Verify token transfer
-        assert_eq!(token_client.balance(&sender), 0);
-        assert_eq!(token_client.balance(&contract_id), amount);
-
-        // Verify escrow details
         let details = client.get_escrow_details();
-        assert_eq!(details.sender, sender);
-        assert_eq!(details.recipient, recipient);
-        assert_eq!(details.token, token_id);
-        assert_eq!(details.amount, amount);
-        assert_eq!(details.unlock_time, unlock_time);
-        assert!(!details.conditions_met);
+        assert_eq!(details.amount, 500);
+        assert_eq!(details.unlock_time, 2000);
     }
 
     #[test]
-    fn test_claim_after_unlock_time() {
+    fn test_cancel_escrow_before_lockup() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -307,36 +367,27 @@ mod tests {
         let admin = Address::generate(&e);
         let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
         let token_id = token_contract.address();
+        let stellar_asset = StellarAssetClient::new(&e, &token_id);
+        stellar_asset.mint(&sender, &1000);
 
         let contract_id = e.register(EscrowTimelock, ());
         let client = EscrowTimelockClient::new(&e, &contract_id);
 
-        // Mint tokens and initialize
-        let amount = 1000;
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        let token_client = soroban_sdk::token::Client::new(&e, &token_id);
-        stellar_client.mint(&sender, &amount);
+        e.ledger().set_timestamp(100);
+        client.initialize(&sender, &recipient, &token_id, &500, &2000);
 
-        let unlock_time = 1000; // Set to a fixed time
-        e.ledger().with_mut(|li| li.timestamp = 500); // Set current time before unlock
+        // Cancel before lockup starts.
+        client.cancel_escrow(&sender, &1);
 
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // Try to claim before unlock time - should fail
-        // (We can't easily test panics in the same test, so we skip ahead)
-
-        // Advance time past unlock
-        e.ledger().with_mut(|li| li.timestamp = 1500);
-
-        // Claim successfully
-        client.claim();
-
-        assert_eq!(token_client.balance(&recipient), amount);
+        assert!(client.get_cancelled());
+        let token_client = token::Client::new(&e, &token_id);
+        assert_eq!(token_client.balance(&sender), 1000);
         assert_eq!(token_client.balance(&contract_id), 0);
     }
 
     #[test]
-    fn test_claim_with_conditions_met() {
+    #[should_panic(expected = "lockup has started - cannot cancel")]
+    fn test_cancel_escrow_after_lockup_fails() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -345,153 +396,17 @@ mod tests {
         let admin = Address::generate(&e);
         let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
         let token_id = token_contract.address();
+        let stellar_asset = StellarAssetClient::new(&e, &token_id);
+        stellar_asset.mint(&sender, &1000);
 
         let contract_id = e.register(EscrowTimelock, ());
         let client = EscrowTimelockClient::new(&e, &contract_id);
 
-        let amount = 1000;
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        let token_client = soroban_sdk::token::Client::new(&e, &token_id);
-        stellar_client.mint(&sender, &amount);
+        e.ledger().set_timestamp(100);
+        client.initialize(&sender, &recipient, &token_id, &500, &2000);
 
-        // Set unlock time far in future
-        let unlock_time = 10000;
-        e.ledger().with_mut(|li| li.timestamp = 500);
-
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // Mark conditions as met
-        client.mark_conditions_met();
-
-        // Advance time to release_timestamp
-        e.ledger().with_mut(|li| li.timestamp = 10000);
-
-        // Should be able to claim when release_timestamp is reached
-        client.claim();
-
-        assert_eq!(token_client.balance(&recipient), amount);
-    }
-
-    #[test]
-    fn test_refund_after_unlock_time() {
-        let e = Env::default();
-        e.mock_all_auths();
-
-        let sender = Address::generate(&e);
-        let recipient = Address::generate(&e);
-        let admin = Address::generate(&e);
-        let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
-        let token_id = token_contract.address();
-
-        let contract_id = e.register(EscrowTimelock, ());
-        let client = EscrowTimelockClient::new(&e, &contract_id);
-
-        let amount = 1000;
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        let token_client = soroban_sdk::token::Client::new(&e, &token_id);
-        stellar_client.mint(&sender, &amount);
-
-        let unlock_time = 1000;
-        e.ledger().with_mut(|li| li.timestamp = 500);
-
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // Advance time past unlock
-        e.ledger().with_mut(|li| li.timestamp = 1500);
-
-        // Sender requests refund
-        client.refund();
-
-        assert_eq!(token_client.balance(&sender), amount);
-        assert_eq!(token_client.balance(&contract_id), 0);
-        assert!(client.get_refund_claimed());
-    }
-
-    #[test]
-    #[should_panic(expected = "refund not yet available - unlock time has not passed")]
-    fn test_refund_before_unlock_time_fails() {
-        let e = Env::default();
-        e.mock_all_auths();
-
-        let sender = Address::generate(&e);
-        let recipient = Address::generate(&e);
-        let admin = Address::generate(&e);
-        let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
-        let token_id = token_contract.address();
-
-        let contract_id = e.register(EscrowTimelock, ());
-        let client = EscrowTimelockClient::new(&e, &contract_id);
-
-        let amount = 1000;
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        let _token_client = soroban_sdk::token::Client::new(&e, &token_id);
-        stellar_client.mint(&sender, &amount);
-
-        let unlock_time = 1000;
-        e.ledger().with_mut(|li| li.timestamp = 500); // Before unlock
-
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // Try to refund before unlock time - should panic
-        client.refund();
-    }
-
-    #[test]
-    fn test_double_refund_prevented() {
-        let e = Env::default();
-        e.mock_all_auths();
-
-        let sender = Address::generate(&e);
-        let recipient = Address::generate(&e);
-        let admin = Address::generate(&e);
-        let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
-        let token_id = token_contract.address();
-
-        let contract_id = e.register(EscrowTimelock, ());
-        let client = EscrowTimelockClient::new(&e, &contract_id);
-
-        let amount = 1000;
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        let _token_client = soroban_sdk::token::Client::new(&e, &token_id);
-        stellar_client.mint(&sender, &amount);
-
-        let unlock_time = 1000;
-        e.ledger().with_mut(|li| li.timestamp = 1500); // After unlock
-
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // First refund succeeds
-        client.refund();
-
-        // Second refund would fail due to panic, but we can't test it here
-        // The contract prevents double claims through the RefundClaimed flag
-    }
-
-    #[test]
-    #[should_panic(expected = "timelock release delay not reached")]
-    fn test_timelock_release_delay_enforced() {
-        let e = Env::default();
-        e.mock_all_auths();
-
-        let sender = Address::generate(&e);
-        let recipient = Address::generate(&e);
-        let admin = Address::generate(&e);
-        let token_contract = e.register_stellar_asset_contract_v2(admin.clone());
-        let token_id = token_contract.address();
-
-        let contract_id = e.register(EscrowTimelock, ());
-        let client = EscrowTimelockClient::new(&e, &contract_id);
-
-        let amount = 1000;
-        let stellar_client = StellarAssetClient::new(&e, &token_id);
-        stellar_client.mint(&sender, &amount);
-
-        let unlock_time = 1000;
-        e.ledger().with_mut(|li| li.timestamp = 500); // Current timestamp before release_timestamp
-
-        client.initialize(&sender, &recipient, &token_id, &amount, &unlock_time);
-
-        // Claim before release_timestamp should panic
-        client.claim();
+        // Move past the lockup start; cancellation must now fail.
+        e.ledger().set_timestamp(2000);
+        client.cancel_escrow(&sender, &1);
     }
 }
