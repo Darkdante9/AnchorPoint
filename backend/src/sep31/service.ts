@@ -14,6 +14,19 @@ import logger from "../utils/logger";
 // ─── In-memory store (replace with DB in production) ──────────────────────
 const transactionStore = new Map<string, Sep31TransactionRecord>();
 
+// ─── In-memory quote store (used for short-lived exchange rate locks) ─────
+export interface QuoteRecord {
+  id: string;
+  sellAsset: string;
+  buyAsset: string;
+  price: string;
+  expiresAt: Date;
+  /** Set once a transaction has locked this quote's rate; quotes are single-use. */
+  usedBy?: string;
+}
+
+const quoteStore = new Map<string, QuoteRecord>();
+
 // ─── Anchor configuration (would come from env / config in production) ─────
 const ANCHOR_STELLAR_ACCOUNT =
   process.env.ANCHOR_DISTRIBUTION_ACCOUNT ??
@@ -154,7 +167,7 @@ export async function checkReceiverKyc(receiverId: string): Promise<void> {
 /** Resolves fee parameters from config or falls back to hardcoded defaults. */
 function resolveFeeParams(
   assetCode: string,
-  sep31Config?: Sep31Config
+  sep31Config?: Sep31Config,
 ): { feePercent: number; feeFixed: number } {
   if (sep31Config?.assets) {
     const assetCfg = sep31Config.assets[assetCode.toUpperCase()];
@@ -171,7 +184,7 @@ function resolveFeeParams(
 function calculateAmountOut(
   amountIn: string,
   feePercent: number,
-  feeFixed: number
+  feeFixed: number,
 ): string {
   const raw = parseFloat(amountIn);
   const fee = raw * feePercent + feeFixed;
@@ -181,7 +194,7 @@ function calculateAmountOut(
 function calculateFee(
   amountIn: string,
   feePercent: number,
-  feeFixed: number
+  feeFixed: number,
 ): string {
   const raw = parseFloat(amountIn);
   return (raw * feePercent + feeFixed).toFixed(7);
@@ -193,7 +206,7 @@ function calculateFee(
 function buildFeeBreakdown(
   amountIn: string,
   feePercent: number,
-  feeFixed: number
+  feeFixed: number,
 ): FeeBreakdownItem[] {
   const items: FeeBreakdownItem[] = [];
   const raw = parseFloat(amountIn);
@@ -226,6 +239,57 @@ function buildFeeBreakdown(
   return items;
 }
 
+// ─── Quote helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Validates that the given quote_id refers to an existing, non-expired quote.
+ * Throws a descriptive error when validation fails so the caller can surface
+ * a 400-level response to the client.
+ */
+function validateQuote(quoteId: string): QuoteRecord {
+  const quote = quoteStore.get(quoteId);
+
+  if (!quote) {
+    throw new Error(`quote_not_found: quote ${quoteId} does not exist`);
+  }
+
+  if (new Date() > quote.expiresAt) {
+    throw new Error(
+      `quote_expired: quote ${quoteId} expired at ${quote.expiresAt.toISOString()}`,
+    );
+  }
+
+  if (quote.usedBy) {
+    throw new Error(
+      `quote_already_used: quote ${quoteId} is bound to transaction ${quote.usedBy}`,
+    );
+  }
+
+  return quote;
+}
+
+/**
+ * Creates a short-lived exchange-rate quote.
+ * The default TTL is 60 seconds, matching the FX volatility window.
+ */
+export function createQuote(
+  sellAsset: string,
+  buyAsset: string,
+  price: string,
+  ttlSeconds = 60,
+): QuoteRecord {
+  const id = uuidv4();
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1_000);
+  const record: QuoteRecord = { id, sellAsset, buyAsset, price, expiresAt };
+  quoteStore.set(id, record);
+  return record;
+}
+
+/** Retrieves a quote without expiry validation (for read-only inspection). */
+export function getQuote(id: string): QuoteRecord | null {
+  return quoteStore.get(id) ?? null;
+}
+
 // ─── Service ───────────────────────────────────────────────────────────────
 
 /**
@@ -233,6 +297,9 @@ function buildFeeBreakdown(
  * Returns the data the sending anchor needs to initiate the Stellar payment,
  * including a transparent fee breakdown.
  *
+ * When a `quote_id` is supplied the quote must exist and must not have expired;
+ * an expired quote causes the function to throw so the caller can return a
+ * 400 response to the sending anchor.
  * Receiver KYC check: when `receiver_id` is provided the function verifies
  * that the receiver's KYC status is ACCEPTED before accepting the transaction.
  * A rejected/pending receiver causes a 400-level error with code
@@ -249,8 +316,13 @@ function buildFeeBreakdown(
  */
 export async function createSep31Transaction(
   req: Sep31TransactionRequest,
-  sep31Config?: Sep31Config
+  sep31Config?: Sep31Config,
 ): Promise<Sep31TransactionResponse> {
+  // ── Quote expiry validation ──────────────────────────────────────────────
+  // Throws if quote is missing, expired or already used — caller maps to 400
+  const quote = req.quote_id ? validateQuote(req.quote_id) : null;
+
+  const { feePercent, feeFixed } = resolveFeeParams(req.asset_code, sep31Config);
   // ── Receiver KYC check (#1189) ───────────────────────────────────────────
   if (req.receiver_id) {
     await checkReceiverKyc(req.receiver_id);
@@ -306,8 +378,14 @@ export async function createSep31Transaction(
     receiver_info: req.receiver_info,
     started_at: now,
     updated_at: now,
+    quote_id: quote?.id,
+    quote_price: quote?.price,
   };
 
+  // Lock the exchange rate: the quote is consumed by this transaction.
+  if (quote) {
+    quote.usedBy = id;
+  }
   transactionStore.set(id, record);
 
   return {
@@ -326,7 +404,7 @@ export async function createSep31Transaction(
  * Returns null when the transaction does not exist.
  */
 export async function getSep31Transaction(
-  id: string
+  id: string,
 ): Promise<Sep31TransactionRecord | null> {
   return transactionStore.get(id) ?? null;
 }
@@ -342,7 +420,7 @@ export async function updateSep31TransactionStatus(
     status_message?: string;
     stellar_transaction_id?: string;
     external_transaction_id?: string;
-  } = {}
+  } = {},
 ): Promise<Sep31TransactionRecord | null> {
   const record = transactionStore.get(id);
   if (!record) return null;
@@ -380,7 +458,7 @@ export function getSep31Info(sep31Config?: Sep31Config) {
       max_amount: 1_000_000,
       fee_fixed: 0,
       fee_percent: 0.5,
-      quotes_supported: false,
+      quotes_supported: true,
       quotes_required: false,
       sender_sep12_type: "sep31-sender",
       receiver_sep12_type: "sep31-receiver",
@@ -391,7 +469,7 @@ export function getSep31Info(sep31Config?: Sep31Config) {
       max_amount: 1_000_000,
       fee_fixed: 0,
       fee_percent: 0.5,
-      quotes_supported: false,
+      quotes_supported: true,
       quotes_required: false,
       sender_sep12_type: "sep31-sender",
       receiver_sep12_type: "sep31-receiver",
