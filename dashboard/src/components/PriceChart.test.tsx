@@ -34,14 +34,14 @@ describe('PriceChart', () => {
       <PriceChart data={mockData} sourceAsset="USDC" destinationAsset="XLM" />
     );
     expect(screen.getByText(/High: 1.200000/i)).toBeInTheDocument();
-    expect(screen.getByText(/Low: 1.100000/i)).toBeIntheDocument();
+    expect(screen.getByText(/Low: 1.100000/i)).toBeInTheDocument();
   });
 
-  test'renders an SVG line chart', () => {
+  test('renders an SVG line chart', () => {
     const { container } = render(
       <PriceChart data={mockData} sourceAsset="USDC" destinationAsset="XLM" />
     );
     const svg = container.querySelector('svg');
-    expect(svg).toBeIntheDocument();
+    expect(svg).toBeInTheDocument();
   });
 });
